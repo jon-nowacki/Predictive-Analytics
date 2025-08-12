@@ -46,7 +46,9 @@ Model fit: Compute R² = 1 - (SSE / SST), where SSE is the sum of squared residu
 
 #### Step 3: Implementation in Python
 Here's a complete code snippet to prepare the data, fit the GLM, and compute the fraction. Assume your data is in a Pandas DataFrame called df.
-pythonimport pandas as pd
+python
+```
+import pandas as pd
 import numpy as np
 import statsmodels.api as sm
 from statsmodels.genmod.generalized_linear_model import GLM
@@ -102,6 +104,7 @@ boost_example = promo_df['boost'].iloc[0]
 boh_increase_example = promo_df['BOH_INCREASE'].iloc[0]
 fraction_example = (beta_boost * boost_example) / boh_increase_example if boh_increase_example != 0 else np.nan
 print(f"Fraction for example week: {fraction_example}")
+```
 Step 4: Interpretation and Fraction Calculation
 
 Coefficient on boost (β₁): This directly gives the marginal fraction: how much BOH increases per unit of boosted allocation from the multiplier. If β₁ is close to 0, the multiplier accurately predicts sales (little unsold boost). If close to 1, nearly all the boost remains in BOH (overestimation). Negative values suggest underestimation.
@@ -117,3 +120,71 @@ Simple model (boost only): β₁ ≈ 0.335, R² ≈ 0.84
 Full model: β₁ ≈ 0.296, R² ≈ 0.86
 
 This confirms the model recovers the true fraction (~0.3) well, meaning about 30% of the multiplier-driven boost leads to higher BOH (e.g., due to overestimated promo sales). The high R² indicates the multiplier explains most of the variation in BOH increases. Apply this to your real data for specific results.
+
+
+### Databricks Version
+
+```
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when, mean
+from pyspark.ml.feature import VectorAssembler
+from pyspark.ml.regression import GeneralizedLinearRegression
+from pyspark.ml.evaluation import RegressionEvaluator
+
+# Assuming SparkSession is already active in Databricks; if not, uncomment below
+# spark = SparkSession.builder.appName("GLM Adjustment").getOrCreate()
+
+# Assume df is your Spark DataFrame loaded from a table or file, e.g.:
+# df = spark.read.table("your_database.your_table_name")
+# or df = spark.read.parquet("/path/to/data")
+
+# Step 1: Data preparation
+# Set MULTIPLIER to 1 for regular weeks
+df = df.withColumn("MULTIPLIER", when(col("PROMO_WEEK") == "REG", 1).otherwise(col("MULTIPLIER")))
+
+# Compute average BOH for regular weeks per SKU and store
+reg_df = df.filter(col("PROMO_WEEK") == "REG")
+avg_reg = reg_df.groupBy("SKU_NBR", "STORE_NBR").agg(mean("BOH").alias("AVG_BOH_REG"))
+
+# Filter to promo weeks and compute increase
+promo_df = df.filter(col("PROMO_WEEK") != "REG").join(avg_reg, on=["SKU_NBR", "STORE_NBR"], how="inner")
+promo_df = promo_df.withColumn("BOH_INCREASE", col("BOH") - col("AVG_BOH_REG"))
+
+# Compute boost
+promo_df = promo_df.withColumn("boost", col("ML_FORECAST") * (col("MULTIPLIER") - 1))
+
+# Step 2: Fit GLM (simple model with just boost)
+simple_assembler = VectorAssembler(inputCols=["boost"], outputCol="features")
+promo_simple = simple_assembler.transform(promo_df)
+
+glr = GeneralizedLinearRegression(family="gaussian", link="identity", labelCol="BOH_INCREASE", featuresCol="features")
+simple_model = glr.fit(promo_simple)
+print(simple_model.summary)
+
+# Compute R² for simple model
+evaluator = RegressionEvaluator(labelCol="BOH_INCREASE", predictionCol="prediction", metricName="r2")
+simple_predictions = simple_model.transform(promo_simple)
+r2_simple = evaluator.evaluate(simple_predictions)
+print(f"R² (multiplier only): {r2_simple}")
+
+# Fit full model with controls
+feature_columns = ["boost", "YEARLY_SALES", "ML_FORECAST", "SKU_COST"]
+full_assembler = VectorAssembler(inputCols=feature_columns, outputCol="features")
+promo_full = full_assembler.transform(promo_df)
+
+full_model = glr.fit(promo_full)
+print(full_model.summary)
+
+# Compute R² for full model
+full_predictions = full_model.transform(promo_full)
+r2_full = evaluator.evaluate(full_predictions)
+print(f"R² (full model): {r2_full}")
+
+# Step 3: Compute fraction for a particular week (example for first row)
+beta_boost = full_model.coefficients[0]  # boost is the first feature
+first_row = promo_df.first()
+boost_example = first_row["boost"]
+boh_increase_example = first_row["BOH_INCREASE"]
+fraction_example = (beta_boost * boost_example) / boh_increase_example if boh_increase_example != 0 else float('nan')
+print(f"Fraction for example week: {fraction_example}")
+```
